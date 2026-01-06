@@ -97,7 +97,12 @@ def round_price(p):
 def get_price(symbol):
     req = StockLatestTradeRequest(symbol_or_symbols=symbol)
     trade = data_client.get_stock_latest_trade(req)[symbol]
-    return float(trade.price)
+    price = float(trade.price)
+
+    log.info(f"{symbol} | Last price fetched: {price}")
+
+    return price
+
 
 # =========================
 # ORDER SYNC
