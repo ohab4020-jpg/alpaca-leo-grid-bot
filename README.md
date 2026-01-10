@@ -1,2 +1,2 @@
-# alpaca-gld-grid-bot
-alpaca-gld-grid-bot
+# alpaca-leo-grid-bot
+alpaca-leo-grid-bot
