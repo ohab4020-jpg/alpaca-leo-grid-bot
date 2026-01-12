@@ -31,14 +31,14 @@ BOTS = {
     "GLD": {
         "lower": 403.28,
         "upper": 436.84,
-        "grid_pct": 0.003,      # 0.3% geometric spacing
+        "grid_pct": 0.004,      # 0.4% geometric spacing
         "order_usd": 3000,      # you can change later
         "max_capital": 50000
     },
     "SLV": {
         "lower": 70.80,
         "upper": 81.82,
-        "grid_pct": 0.003,      # 0.3% geometric spacing
+        "grid_pct": 0.006,      # 0.6% geometric spacing
         "order_usd": 3000,      # you can change later
         "max_capital": 50000
     }
