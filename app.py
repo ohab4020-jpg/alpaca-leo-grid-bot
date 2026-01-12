@@ -36,8 +36,8 @@ BOTS = {
         "max_capital": 35000
     },
     "SLV": {
-        "lower": 63.00,
-        "upper": 77.48,
+        "lower": 55.68,
+        "upper": 81.82,
         "grid_pct": 0.005,      # 0.5% geometric spacing
         "order_usd": 1500,      # you can change later
         "max_capital": 60000
