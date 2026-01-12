@@ -29,7 +29,7 @@ log = logging.getLogger("leo")
 # =======================
 BOTS = {
     "GLD": {
-        "lower": 365.76,
+        "lower": 403.28,
         "upper": 436.84,
         "grid_pct": 0.003,      # 0.3% geometric spacing
         "order_usd": 3000,      # you can change later
