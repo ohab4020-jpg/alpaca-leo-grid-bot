@@ -418,7 +418,9 @@ def run_symbol(symbol: str, cfg: dict):
     sell_reserved = open_sell_qty(open_orders)
     free_qty = max(0.0, pos_qty - sell_reserved)
 
-    # Decide BUY level & SELL level
+    # =========================
+    # Decide BUY & SELL levels
+    # =========================
     buy_level = nearest_buy_level(levels, last_price)
     sell_level = nearest_sell_level(levels, last_price)
 
@@ -436,11 +438,10 @@ def run_symbol(symbol: str, cfg: dict):
                 "price": last_price,
             }
 
-
-    # 1) Prefer SELL if we have inventory and a sell level exists and no open sell at that level
+    # =========================
+    # 1) SELL LOGIC
+    # =========================
     if sell_level is not None:
-        # quantity in shares (ETFs allow fractional? Alpaca usually supports whole shares for equities.
-        # We'll use whole shares to be safe.)
         sell_qty = math.floor(order_usd / sell_level)
         if sell_qty > 0 and free_qty >= sell_qty:
             if not has_open_order_at(open_orders, "sell", sell_level):
@@ -450,29 +451,37 @@ def run_symbol(symbol: str, cfg: dict):
                         msg = f"🔴 SELL | {symbol}\nQty: {sell_qty} @ {sell_level}"
                         log.info(msg.replace("\n", " | "))
                         tg_send(msg)
-                        return {"symbol": symbol, "action": "sell", "qty": sell_qty, "price": sell_level}
+                        return {
+                            "symbol": symbol,
+                            "action": "sell",
+                            "qty": sell_qty,
+                            "price": sell_level,
+                        }
                 except Exception as e:
                     msg = f"❌ SELL failed | {symbol} | {e}"
                     log.error(msg)
                     tg_send(msg)
                     return {"symbol": symbol, "action": "error", "reason": "sell_failed"}
-        # else: cannot sell now
 
-    # 2) BUY if within capital and no open buy at that level
+    # =========================
+    # 2) BUY LOGIC
+    # =========================
     if buy_level is not None:
         buy_qty = math.floor(order_usd / buy_level)
         if buy_qty <= 0:
             return {"symbol": symbol, "action": "none", "reason": "buy_qty_zero"}
 
-        # NEW: block re-buying the same grid level when inventory already exists at that level
         if has_inventory_at_level(symbol, buy_level):
             log.info(f"🟡 {symbol} inventory already exists near {buy_level}, skipping BUY")
-            return {"symbol": symbol, "action": "none", "reason": "inventory_exists", "price": last_price}
+            return {"symbol": symbol, "action": "none", "reason": "inventory_exists"}
 
         projected = used + (buy_qty * buy_level)
         if projected > max_capital:
-            log.info(f"🟠 {symbol} BUY blocked (capital) used≈${used:,.2f} projected≈${projected:,.2f} max=${max_capital:,.2f}")
-            return {"symbol": symbol, "action": "none", "reason": "max_capital", "used": used, "price": last_price}
+            log.info(
+                f"🟠 {symbol} BUY blocked (capital) "
+                f"used≈${used:,.2f} projected≈${projected:,.2f}"
+            )
+            return {"symbol": symbol, "action": "none", "reason": "max_capital"}
 
         if not has_open_order_at(open_orders, "buy", buy_level):
             try:
@@ -481,16 +490,22 @@ def run_symbol(symbol: str, cfg: dict):
                     msg = f"🟢 BUY | {symbol}\nQty: {buy_qty} @ {buy_level}"
                     log.info(msg.replace("\n", " | "))
                     tg_send(msg)
-                    return {"symbol": symbol, "action": "buy", "qty": buy_qty, "price": buy_level}
+                    return {
+                        "symbol": symbol,
+                        "action": "buy",
+                        "qty": buy_qty,
+                        "price": buy_level,
+                    }
             except Exception as e:
                 msg = f"❌ BUY failed | {symbol} | {e}"
                 log.error(msg)
                 tg_send(msg)
                 return {"symbol": symbol, "action": "error", "reason": "buy_failed"}
 
-    # Nothing to do
+    # =========================
+    # NOTHING TO DO
+    # =========================
     return {"symbol": symbol, "action": "none", "reason": "no_signal", "price": last_price}
-
 
 # =======================
 # ROUTES
