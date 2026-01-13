@@ -380,6 +380,54 @@ def reconcile_lots(conn, symbol: str, open_orders):
                 db_upsert_lot(conn, symbol, float(lot["buy_level"]), float(lot["sell_level"]), float(lot["qty"]), "owned",
                               buy_order_id=buy_oid, sell_order_id=None)
 
+# >>> NEW PATCH (SIMPLE SEED):
+# If you already hold a position but grid_lots is empty (e.g., after a fork/redeploy),
+# create ONE owned lot at the closest grid level to avg_entry_price.
+# This is idempotent: once lots exist for the symbol, it won’t keep changing anything.
+def seed_one_lot_if_needed(conn, symbol: str, levels):
+    try:
+        # If memory already exists for this symbol, do nothing (keeps your current behavior)
+        existing_lots = db_list_lots(conn, symbol)
+        if existing_lots:
+            return
+
+        qty = get_position_qty(symbol)
+        if qty <= 0.0:
+            return
+
+        # Pull avg entry from Alpaca
+        try:
+            pos = trading.get_open_position(symbol)
+            avg_price = float(pos.avg_entry_price)
+        except Exception:
+            return
+
+        if not levels:
+            return
+
+        # Find closest grid level to avg entry (simple seed)
+        buy_level = min(levels, key=lambda lv: abs(float(lv) - float(avg_price)))
+        sell_target = next_level_above(levels, buy_level)
+        if sell_target is None:
+            return
+
+        # Seed as owned, with qty = current position qty
+        db_upsert_lot(
+            conn,
+            symbol,
+            float(buy_level),
+            float(sell_target),
+            float(qty),
+            "owned",
+            buy_order_id=None,
+            sell_order_id=None
+        )
+
+        log.info(f"🧩 Seeded {symbol} memory: owned lot at buy_level={buy_level} qty={qty} (avg_entry≈{avg_price:.2f})")
+    except Exception as e:
+        # never crash /run due to seed
+        log.warning(f"{symbol} seed failed: {e}")
+
 
 # =======================
 # DAILY SUMMARY
@@ -449,6 +497,9 @@ def run_symbol(conn, symbol: str, cfg: dict):
         return {"symbol": symbol, "action": "none", "reason": "no_levels"}
 
     open_orders = get_open_orders(symbol)
+
+    # >>> NEW PATCH (SIMPLE SEED): only seeds if grid_lots empty for this symbol and you already hold shares
+    seed_one_lot_if_needed(conn, symbol, levels)
 
     # >>> NEW/CHANGED: reconcile our DB memory with Alpaca order reality
     reconcile_lots(conn, symbol, open_orders)
