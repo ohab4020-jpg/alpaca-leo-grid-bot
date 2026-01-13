@@ -418,23 +418,23 @@ def run_symbol(symbol: str, cfg: dict):
     sell_reserved = open_sell_qty(open_orders)
     free_qty = max(0.0, pos_qty - sell_reserved)
 
-# Decide BUY level & SELL level
-buy_level = nearest_buy_level(levels, last_price)
-sell_level = nearest_sell_level(levels, last_price)
+    # Decide BUY level & SELL level
+    buy_level = nearest_buy_level(levels, last_price)
+    sell_level = nearest_sell_level(levels, last_price)
 
-# 🚫 Prevent buy & sell at same (or too-close) price
-if buy_level is not None and sell_level is not None:
-    if sell_level - buy_level < MIN_TICK:
-        log.info(
-            f"🟡 {symbol} buy/sell too close "
-            f"(buy={buy_level}, sell={sell_level}), skipping"
-        )
-        return {
-            "symbol": symbol,
-            "action": "none",
-            "reason": "min_tick_guard",
-            "price": last_price,
-        }
+    # 🚫 Prevent buy & sell at same (or too-close) price
+    if buy_level is not None and sell_level is not None:
+        if sell_level - buy_level < MIN_TICK:
+            log.info(
+                f"🟡 {symbol} buy/sell too close "
+                f"(buy={buy_level}, sell={sell_level}), skipping"
+            )
+            return {
+                "symbol": symbol,
+                "action": "none",
+                "reason": "min_tick_guard",
+                "price": last_price,
+            }
 
 
     # 1) Prefer SELL if we have inventory and a sell level exists and no open sell at that level
