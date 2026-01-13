@@ -1,7 +1,7 @@
 import os
 import math
 import logging
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta  # >>> NEW/CHANGED
 from decimal import Decimal, ROUND_HALF_UP
 
 import requests
@@ -28,76 +28,16 @@ log = logging.getLogger("leo")
 # CONFIG (EDIT THIS)
 # =======================
 BOTS = {
-    "GLD": {
-        "lower": 403.28,
-        "upper": 436.84,
-        "grid_pct": 0.004,
-        "order_usd": 2500,
-        "max_capital": 30000
-    },
-    "SLV": {
-        "lower": 70.80,
-        "upper": 81.82,
-        "grid_pct": 0.006,
-        "order_usd": 2500,
-        "max_capital": 30000
-    },
-    "MARA": {
-        "lower": 9.0,
-        "upper": 16.50,
-        "grid_pct": 0.015,
-        "order_usd": 2500,
-        "max_capital": 30000
-    },
-    "MSTR": {
-        "lower": 148.00,
-        "upper": 177.00,
-        "grid_pct": 0.015,
-        "order_usd": 2500,
-        "max_capital": 30000
-    },
-    "BTBT": {
-        "lower": 1.87,
-        "upper": 3.37,
-        "grid_pct": 0.015,
-        "order_usd": 2500,
-        "max_capital": 30000
-    },
-    "RSP": {
-        "lower": 191.15,
-        "upper": 204.76,
-        "grid_pct": 0.005,
-        "order_usd": 2500,
-        "max_capital": 30000
-    },
-    "GOOG": {
-        "lower": 295.00,
-        "upper": 360.96,
-        "grid_pct": 0.005,
-        "order_usd": 2500,
-        "max_capital": 30000
-    },
-    "AAPL": {
-        "lower": 250.00,
-        "upper": 298.00,
-        "grid_pct": 0.005,
-        "order_usd": 2500,
-        "max_capital": 30000
-    },
-    "MSFT": {
-        "lower": 446.00,
-        "upper": 526.00,
-        "grid_pct": 0.005,
-        "order_usd": 2500,
-        "max_capital": 30000
-    },
-    "AMZN": {
-        "lower": 200.00,
-        "upper": 265.96,
-        "grid_pct": 0.005,
-        "order_usd": 2500,
-        "max_capital": 30000
-    }
+    "GLD": {"lower": 403.28, "upper": 436.84, "grid_pct": 0.004, "order_usd": 2500, "max_capital": 30000},
+    "SLV": {"lower": 70.80, "upper": 81.82, "grid_pct": 0.006, "order_usd": 2500, "max_capital": 30000},
+    "MARA": {"lower": 9.0, "upper": 16.50, "grid_pct": 0.015, "order_usd": 2500, "max_capital": 30000},
+    "MSTR": {"lower": 148.00, "upper": 177.00, "grid_pct": 0.015, "order_usd": 2500, "max_capital": 30000},
+    "BTBT": {"lower": 1.87, "upper": 3.37, "grid_pct": 0.015, "order_usd": 2500, "max_capital": 30000},
+    "RSP": {"lower": 191.15, "upper": 204.76, "grid_pct": 0.005, "order_usd": 2500, "max_capital": 30000},
+    "GOOG": {"lower": 295.00, "upper": 360.96, "grid_pct": 0.005, "order_usd": 2500, "max_capital": 30000},
+    "AAPL": {"lower": 250.00, "upper": 298.00, "grid_pct": 0.005, "order_usd": 2500, "max_capital": 30000},
+    "MSFT": {"lower": 446.00, "upper": 526.00, "grid_pct": 0.005, "order_usd": 2500, "max_capital": 30000},
+    "AMZN": {"lower": 200.00, "upper": 265.96, "grid_pct": 0.005, "order_usd": 2500, "max_capital": 30000},
 }
 
 MIN_TICK = 0.01  # 🔒 minimum price difference to avoid buy/sell at same level
@@ -114,12 +54,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # Send daily summary after this UTC hour (0-23). (Example: 20 = 20:00 UTC)
 DAILY_SUMMARY_HOUR_UTC = int(os.getenv("DAILY_SUMMARY_HOUR_UTC", "20"))
 
-# NEW: inventory-level tolerance (default 0.2% = 0.002)
-INVENTORY_LEVEL_TOLERANCE_PCT = float(os.getenv("INVENTORY_LEVEL_TOLERANCE_PCT", "0.002"))
-
 
 # =======================
-# ALPACA KEYS (support both naming styles)
+# ALPACA KEYS
 # =======================
 ALPACA_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("ALPACA_KEY")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY") or os.getenv("ALPACA_SECRET")
@@ -162,7 +99,6 @@ def tg_send(text: str) -> None:
         log.warning(f"Telegram send failed: {e}")
 
 def pg_conn():
-    # Use a short statement timeout to avoid hanging
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     conn.autocommit = False
     return conn
@@ -188,6 +124,22 @@ def init_db():
                     summary_sent BOOLEAN NOT NULL DEFAULT FALSE
                 );
             """)
+
+            # >>> NEW/CHANGED: grid memory table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS grid_lots (
+                    symbol TEXT NOT NULL,
+                    buy_level NUMERIC NOT NULL,
+                    sell_level NUMERIC NOT NULL,
+                    qty NUMERIC NOT NULL,
+                    state TEXT NOT NULL, -- buy_open | owned | sell_open
+                    buy_order_id TEXT,
+                    sell_order_id TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY(symbol, buy_level)
+                );
+            """)
+
         conn.commit()
         log.info("✅ Postgres initialized")
     finally:
@@ -195,10 +147,9 @@ def init_db():
 
 
 # =======================
-# GLOBAL RUN LOCK (prevents double /run due to retries)
+# GLOBAL RUN LOCK
 # =======================
 def acquire_global_lock(conn) -> bool:
-    # Arbitrary lock key. Same key = same lock.
     lock_key = 99112233
     with conn.cursor() as cur:
         cur.execute("SELECT pg_try_advisory_lock(%s) AS locked;", (lock_key,))
@@ -230,46 +181,44 @@ def get_position_qty(symbol: str) -> float:
         return 0.0
 
 def get_open_orders(symbol: str):
-    # Pull open orders from Alpaca (NEW/ACCEPTED/PARTIALLY_FILLED)
     req = GetOrdersRequest(
         status=QueryOrderStatus.OPEN,
         symbols=[symbol]
     )
     return trading.get_orders(filter=req)
 
-
-# =======================
-# NEW: INVENTORY AT GRID LEVEL CHECK
-# =======================
-def has_inventory_at_level(symbol: str, level: float, tolerance_pct: float = INVENTORY_LEVEL_TOLERANCE_PCT) -> bool:
-    """
-    Blocks re-buying the same grid level if our existing position avg entry is close to that level.
-    tolerance_pct default: 0.2% (0.002)
-    """
+# >>> NEW/CHANGED: helper to fetch recent CLOSED orders (to know if a previously-open order filled vs canceled)
+def get_recent_closed_orders(symbol: str, days: int = 14):
     try:
-        pos = trading.get_open_position(symbol)
-        avg_price = float(pos.avg_entry_price)
-        lvl = float(level)
-        if lvl <= 0:
-            return False
-        return abs(avg_price - lvl) / lvl <= float(tolerance_pct)
-    except Exception:
-        return False
+        after = now_utc() - timedelta(days=days)
+        req = GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            symbols=[symbol],
+            after=after  # alpaca-py supports datetime here; if your version errors, remove `after`
+        )
+        return trading.get_orders(filter=req)
+    except Exception as e:
+        # fallback if `after` isn't supported in your installed alpaca-py
+        try:
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                symbols=[symbol]
+            )
+            return trading.get_orders(filter=req)
+        except Exception:
+            log.warning(f"{symbol} closed order fetch failed: {e}")
+            return []
 
 
 # =======================
 # GRID (GEOMETRIC)
 # =======================
 def build_geometric_levels(lower: float, upper: float, grid_pct: float):
-    """
-    Levels: lower, lower*(1+g), lower*(1+g)^2, ... <= upper
-    """
     if lower <= 0 or upper <= 0 or grid_pct <= 0:
         return []
 
     levels = []
     p = lower
-    # safety max iterations
     for _ in range(5000):
         if p > upper + 1e-9:
             break
@@ -278,23 +227,29 @@ def build_geometric_levels(lower: float, upper: float, grid_pct: float):
     return levels
 
 def nearest_buy_level(levels, price: float):
-    # highest level strictly below price
     below = [lv for lv in levels if lv < price]
     return max(below) if below else None
 
 def nearest_sell_level(levels, price: float):
-    # lowest level strictly above price
     above = [lv for lv in levels if lv > price]
     return min(above) if above else None
 
+# >>> NEW/CHANGED: next grid level above a specific level (deterministic sell target)
+def next_level_above(levels, level: float):
+    try:
+        idx = levels.index(d2(level))
+    except ValueError:
+        # level not found (shouldn’t happen if we computed it from levels)
+        return None
+    if idx + 1 >= len(levels):
+        return None
+    return levels[idx + 1]
+
 
 # =======================
-# CAPITAL RULE (prevents runaway ordering)
+# CAPITAL RULE
 # =======================
 def capital_used(symbol: str, last_price: float, open_orders):
-    """
-    "Capital used" = position market value + reserved value of open BUY orders
-    """
     pos_qty = get_position_qty(symbol)
     pos_value = pos_qty * last_price
 
@@ -310,7 +265,6 @@ def capital_used(symbol: str, last_price: float, open_orders):
 # SAFE ORDER PLACEMENT
 # =======================
 def has_open_order_at(open_orders, side: str, price: float) -> bool:
-    # compare by rounded cents
     p = d2(price)
     for o in open_orders:
         if o.side.value.lower() == side.lower():
@@ -346,13 +300,94 @@ def place_limit(symbol: str, side: str, qty: float, price: float):
 
 
 # =======================
+# >>> NEW/CHANGED: GRID MEMORY (DB HELPERS)
+# =======================
+def db_list_lots(conn, symbol: str):
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM grid_lots WHERE symbol=%s;", (symbol,))
+        return cur.fetchall() or []
+
+def db_get_lot(conn, symbol: str, buy_level: float):
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM grid_lots WHERE symbol=%s AND buy_level=%s;", (symbol, d2(buy_level)))
+        return cur.fetchone()
+
+def db_upsert_lot(conn, symbol: str, buy_level: float, sell_level: float, qty: float, state: str, buy_order_id=None, sell_order_id=None):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO grid_lots(symbol, buy_level, sell_level, qty, state, buy_order_id, sell_order_id, updated_at)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,now())
+            ON CONFLICT(symbol, buy_level)
+            DO UPDATE SET
+                sell_level=EXCLUDED.sell_level,
+                qty=EXCLUDED.qty,
+                state=EXCLUDED.state,
+                buy_order_id=COALESCE(EXCLUDED.buy_order_id, grid_lots.buy_order_id),
+                sell_order_id=COALESCE(EXCLUDED.sell_order_id, grid_lots.sell_order_id),
+                updated_at=now();
+        """, (symbol, d2(buy_level), d2(sell_level), float(qty), state, buy_order_id, sell_order_id))
+
+def db_delete_lot(conn, symbol: str, buy_level: float):
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM grid_lots WHERE symbol=%s AND buy_level=%s;", (symbol, d2(buy_level)))
+
+def reconcile_lots(conn, symbol: str, open_orders):
+    """
+    If an order we tracked as buy_open/sell_open is no longer open,
+    check recent CLOSED orders to see if it filled or was canceled.
+    """
+    open_ids = set()
+    for o in open_orders:
+        try:
+            open_ids.add(str(o.id))
+        except Exception:
+            pass
+
+    lots = db_list_lots(conn, symbol)
+    if not lots:
+        return
+
+    closed = get_recent_closed_orders(symbol)
+    closed_by_id = {}
+    for o in closed:
+        try:
+            closed_by_id[str(o.id)] = o
+        except Exception:
+            continue
+
+    for lot in lots:
+        state = lot["state"]
+        buy_oid = lot.get("buy_order_id")
+        sell_oid = lot.get("sell_order_id")
+
+        # BUY open -> decide filled vs canceled
+        if state == "buy_open" and buy_oid and str(buy_oid) not in open_ids:
+            o = closed_by_id.get(str(buy_oid))
+            if o and getattr(o, "status", "").lower() == "filled":
+                db_upsert_lot(conn, symbol, float(lot["buy_level"]), float(lot["sell_level"]), float(lot["qty"]), "owned",
+                              buy_order_id=str(buy_oid), sell_order_id=None)
+            else:
+                # not filled (canceled/rejected/expired/unknown) => forget it
+                db_delete_lot(conn, symbol, float(lot["buy_level"]))
+
+        # SELL open -> if filled, remove lot (level can be re-bought)
+        if state == "sell_open" and sell_oid and str(sell_oid) not in open_ids:
+            o = closed_by_id.get(str(sell_oid))
+            if o and getattr(o, "status", "").lower() == "filled":
+                db_delete_lot(conn, symbol, float(lot["buy_level"]))
+            else:
+                # sell didn't fill -> revert to owned
+                db_upsert_lot(conn, symbol, float(lot["buy_level"]), float(lot["sell_level"]), float(lot["qty"]), "owned",
+                              buy_order_id=buy_oid, sell_order_id=None)
+
+
+# =======================
 # DAILY SUMMARY
 # =======================
 def maybe_daily_summary(conn):
     day = utc_day()
     hour = now_utc().hour
 
-    # Only attempt summary when we are past the configured hour
     if hour < DAILY_SUMMARY_HOUR_UTC:
         return
 
@@ -363,7 +398,6 @@ def maybe_daily_summary(conn):
         row = cur.fetchone()
 
         if row is None:
-            # First time we see this day, store start equity now
             cur.execute(
                 "INSERT INTO daily_equity(day, start_equity, summary_sent) VALUES(%s, %s, false);",
                 (day, equity)
@@ -386,9 +420,10 @@ def maybe_daily_summary(conn):
 
 
 # =======================
-# CORE BOT (one action per symbol per /run, but can accumulate many grids over time)
+# CORE BOT
 # =======================
-def run_symbol(symbol: str, cfg: dict):
+# >>> NEW/CHANGED: accept conn so we can read/write memory
+def run_symbol(conn, symbol: str, cfg: dict):
     lower = float(cfg["lower"])
     upper = float(cfg["upper"])
     grid_pct = float(cfg["grid_pct"])
@@ -404,7 +439,6 @@ def run_symbol(symbol: str, cfg: dict):
     last_price = get_last_price(symbol)
     log.info(f"📈 {symbol} PRICE = {last_price}")
 
-    # outside band => do nothing
     if not (lower <= last_price <= upper):
         log.info(f"🟡 {symbol} outside band [{lower}, {upper}]")
         tg_send(f"🟡 {symbol} outside band [{lower}, {upper}] | price={last_price:.2f}")
@@ -416,66 +450,72 @@ def run_symbol(symbol: str, cfg: dict):
 
     open_orders = get_open_orders(symbol)
 
+    # >>> NEW/CHANGED: reconcile our DB memory with Alpaca order reality
+    reconcile_lots(conn, symbol, open_orders)
+
     used = capital_used(symbol, last_price, open_orders)
     pos_qty = get_position_qty(symbol)
     sell_reserved = open_sell_qty(open_orders)
     free_qty = max(0.0, pos_qty - sell_reserved)
 
-    # Decide BUY level & SELL level
     buy_level = nearest_buy_level(levels, last_price)
     sell_level = nearest_sell_level(levels, last_price)
 
-    # 🚫 Prevent buy & sell at same (or too-close) price
     if buy_level is not None and sell_level is not None:
         if sell_level - buy_level < MIN_TICK:
-            log.info(
-                f"🟡 {symbol} buy/sell too close "
-                f"(buy={buy_level}, sell={sell_level}), skipping"
-            )
-            return {
-                "symbol": symbol,
-                "action": "none",
-                "reason": "min_tick_guard",
-                "price": last_price,
-            }
+            log.info(f"🟡 {symbol} buy/sell too close (buy={buy_level}, sell={sell_level}), skipping")
+            return {"symbol": symbol, "action": "none", "reason": "min_tick_guard", "price": last_price}
 
-    # 1) Prefer SELL if we have inventory and a sell level exists and no open sell at that level
+    # 1) SELL (only if we actually own the corresponding buy_level lot)
     if sell_level is not None:
-        # quantity in shares (ETFs allow fractional? Alpaca usually supports whole shares for equities.
-        # We'll use whole shares to be safe.)
         sell_qty = math.floor(order_usd / sell_level)
         if sell_qty > 0 and free_qty >= sell_qty:
-            if not has_open_order_at(open_orders, "sell", sell_level):
-                try:
-                    o = place_limit(symbol, "sell", sell_qty, sell_level)
-                    if o:
-                        msg = f"🔴 SELL | {symbol}\nQty: {sell_qty} @ {sell_level}"
-                        log.info(msg.replace("\n", " | "))
-                        tg_send(msg)
-                        return {"symbol": symbol, "action": "sell", "qty": sell_qty, "price": sell_level}
-                except Exception as e:
-                    msg = f"❌ SELL failed | {symbol} | {e}"
-                    log.error(msg)
-                    tg_send(msg)
-                    return {"symbol": symbol, "action": "error", "reason": "sell_failed"}
-        # else: cannot sell now
+            # the lot we should be selling is the grid step immediately below this sell_level
+            source_buy = nearest_buy_level(levels, sell_level)
+            if source_buy is not None:
+                lot = db_get_lot(conn, symbol, source_buy)
+                if lot and lot["state"] == "owned" and float(lot["qty"]) >= sell_qty:
+                    if not has_open_order_at(open_orders, "sell", sell_level):
+                        try:
+                            o = place_limit(symbol, "sell", sell_qty, sell_level)
+                            if o:
+                                # mark that lot as being sold
+                                db_upsert_lot(
+                                    conn, symbol,
+                                    float(lot["buy_level"]),
+                                    float(lot["sell_level"]),
+                                    sell_qty,
+                                    "sell_open",
+                                    buy_order_id=lot.get("buy_order_id"),
+                                    sell_order_id=str(o.id)
+                                )
+                                msg = f"🔴 SELL | {symbol}\nQty: {sell_qty} @ {sell_level}"
+                                log.info(msg.replace("\n", " | "))
+                                tg_send(msg)
+                                return {"symbol": symbol, "action": "sell", "qty": sell_qty, "price": sell_level, "from_buy_level": float(lot["buy_level"])}
+                        except Exception as e:
+                            msg = f"❌ SELL failed | {symbol} | {e}"
+                            log.error(msg)
+                            tg_send(msg)
+                            return {"symbol": symbol, "action": "error", "reason": "sell_failed"}
+            # else: no matching owned lot => skip selling this step
 
-    # 2) BUY if within capital and no open buy at that level
+    # 2) BUY (only if we do NOT already own / have pending at that buy_level)
     if buy_level is not None:
         buy_qty = math.floor(order_usd / buy_level)
         if buy_qty <= 0:
             return {"symbol": symbol, "action": "none", "reason": "buy_qty_zero"}
 
-        # NEW: block re-buying the same grid level when inventory already exists at that level
-        if has_inventory_at_level(symbol, buy_level):
-            log.info(f"🟡 {symbol} inventory already exists near {buy_level}, skipping BUY")
-            return {"symbol": symbol, "action": "none", "reason": "inventory_exists", "price": last_price}
+        # >>> NEW/CHANGED: DB-based "memory" check (this is the real fix)
+        existing = db_get_lot(conn, symbol, buy_level)
+        if existing and existing["state"] in ("buy_open", "owned", "sell_open"):
+            log.info(f"🟡 {symbol} already has memory at buy_level={buy_level} (state={existing['state']}), skipping BUY")
+            return {"symbol": symbol, "action": "none", "reason": "level_already_tracked", "buy_level": buy_level, "price": last_price}
 
         projected = used + (buy_qty * buy_level)
         if projected > max_capital:
             log.info(
-                f"🟠 {symbol} BUY blocked (capital) used≈${used:,.2f} "
-                f"projected≈${projected:,.2f} max=${max_capital:,.2f}"
+                f"🟠 {symbol} BUY blocked (capital) used≈${used:,.2f} projected≈${projected:,.2f} max=${max_capital:,.2f}"
             )
             return {"symbol": symbol, "action": "none", "reason": "max_capital", "used": used, "price": last_price}
 
@@ -483,6 +523,22 @@ def run_symbol(symbol: str, cfg: dict):
             try:
                 o = place_limit(symbol, "buy", buy_qty, buy_level)
                 if o:
+                    sell_target = next_level_above(levels, buy_level)
+                    if sell_target is None:
+                        # no next level to sell into; don't buy
+                        return {"symbol": symbol, "action": "none", "reason": "no_sell_target"}
+
+                    # >>> NEW/CHANGED: write memory (pending buy)
+                    db_upsert_lot(
+                        conn, symbol,
+                        buy_level,
+                        sell_target,
+                        buy_qty,
+                        "buy_open",
+                        buy_order_id=str(o.id),
+                        sell_order_id=None
+                    )
+
                     msg = f"🟢 BUY | {symbol}\nQty: {buy_qty} @ {buy_level}"
                     log.info(msg.replace("\n", " | "))
                     tg_send(msg)
@@ -493,7 +549,6 @@ def run_symbol(symbol: str, cfg: dict):
                 tg_send(msg)
                 return {"symbol": symbol, "action": "error", "reason": "buy_failed"}
 
-    # Nothing to do
     return {"symbol": symbol, "action": "none", "reason": "no_signal", "price": last_price}
 
 
@@ -507,7 +562,6 @@ def healthz():
 
 @app.route("/run", methods=["GET"])
 def run():
-    # Auth
     token = request.headers.get("X-RUN-TOKEN", "")
     if not RUN_TOKEN or token != RUN_TOKEN:
         return jsonify({"error": "Unauthorized /run attempt blocked"}), 401
@@ -515,14 +569,13 @@ def run():
     conn = pg_conn()
     try:
         if not acquire_global_lock(conn):
-            # another run is in progress (cron retry etc.)
             return jsonify({"status": "already running"}), 200
 
         results = []
         for sym, cfg in BOTS.items():
-            results.append(run_symbol(sym, cfg))
+            # >>> NEW/CHANGED: pass conn
+            results.append(run_symbol(conn, sym, cfg))
 
-        # daily summary (fires only once/day when /run happens after summary hour)
         maybe_daily_summary(conn)
 
         conn.commit()
@@ -541,10 +594,8 @@ def run():
         conn.close()
 
 
-# Optional: simple Telegram webhook endpoint (read-only)
 @app.route("/telegram", methods=["POST"])
 def telegram_webhook():
-    # This only replies; no trading commands.
     try:
         data = request.get_json(force=True, silent=True) or {}
         msg = (data.get("message") or {}).get("text") or ""
