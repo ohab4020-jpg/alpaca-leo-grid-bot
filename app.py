@@ -13,12 +13,17 @@ from flask import Flask, request, jsonify
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
 
-# ✅ Bracket support (A = Take-profit only)
+# ✅ Bracket support (A = Take-profit + Stop-loss)
 # alpaca-py versions vary a bit; these imports are the canonical ones.
 try:
     from alpaca.trading.requests import TakeProfitRequest  # type: ignore
 except Exception:
     TakeProfitRequest = None  # handled later
+
+try:
+    from alpaca.trading.requests import StopLossRequest  # type: ignore
+except Exception:
+    StopLossRequest = None  # handled later
 
 try:
     from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, OrderClass  # type: ignore
@@ -77,6 +82,16 @@ MAX_NEW_ORDERS_PER_RUN = int(os.getenv("MAX_NEW_ORDERS_PER_RUN", "1"))
 # BUY/SELL ON TOUCH (CROSSING) MODE
 # =======================
 TOUCH_MODE = os.getenv("TOUCH_MODE", "true").lower() == "true"
+
+# =======================
+# WIDE STOP LOSS CONFIG (AUTOMATED)
+# =======================
+# This sets the stop-loss *below* the buy price by a percentage.
+# Example: STOP_LOSS_PCT=0.35 means stop at 35% below the buy (very wide).
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.35"))
+# Optional extra guard: never set stop above this fraction of lower band (keeps stop from being too high in some edge cases)
+# If unset/empty, ignored.
+STOP_LOSS_MIN_FACTOR_OF_LOWER = os.getenv("STOP_LOSS_MIN_FACTOR_OF_LOWER", "").strip()
 
 
 # =======================
@@ -426,12 +441,55 @@ def place_limit(symbol: str, side: str, qty: float, price: float):
     return trading.submit_order(req)
 
 
-# ✅ NEW: BRACKET BUY (A = take-profit ONLY)
-def place_bracket_buy(symbol: str, qty: float, buy_price: float, take_profit_price: float):
+def compute_wide_stop_price(buy_price: float, lower_band: float) -> float:
     """
-    Places one parent BUY limit + one child TAKE-PROFIT sell limit (no stop-loss).
-    This avoids Alpaca 'wash trade detected' / 'opposite side order exists' in many cases,
-    because the buy and its sell are linked as one complex order.
+    Automated wide stop:
+      stop = buy * (1 - STOP_LOSS_PCT)
+    Plus optional extra guard based on lower band.
+
+    It must be strictly below buy_price (Alpaca requirement).
+    """
+    pct = float(STOP_LOSS_PCT)
+    # clamp to something sane to avoid accidental negative/too-tight stops
+    if pct < 0.01:
+        pct = 0.01
+    if pct > 0.95:
+        pct = 0.95
+
+    stop = buy_price * (1.0 - pct)
+
+    # Optional guard: don't let stop be above some factor of the configured lower band.
+    # Example: STOP_LOSS_MIN_FACTOR_OF_LOWER=0.95 => stop <= lower*0.95 (even wider)
+    if STOP_LOSS_MIN_FACTOR_OF_LOWER:
+        try:
+            factor = float(STOP_LOSS_MIN_FACTOR_OF_LOWER)
+            if factor > 0:
+                stop = min(stop, float(lower_band) * factor)
+        except Exception:
+            pass
+
+    stop = d2(stop)
+
+    # Hard safety: ensure strictly < buy and at least MIN_TICK away.
+    if stop >= d2(buy_price):
+        stop = d2(buy_price - MIN_TICK)
+
+    # Don't allow <= 0
+    if stop <= 0:
+        stop = d2(max(MIN_TICK, buy_price * 0.01))
+
+    return stop
+
+
+# ✅ UPDATED: BRACKET BUY (TP + WIDE STOP-LOSS)
+def place_bracket_buy(symbol: str, qty: float, buy_price: float, take_profit_price: float, stop_price: float):
+    """
+    Places one parent BUY limit + two children:
+      - TAKE-PROFIT sell limit
+      - STOP-LOSS sell stop
+
+    Your Alpaca environment requires stop_loss.stop_price for bracket orders.
+    We compute a wide automated stop so it's hard to hit.
     """
     if not TRADING_ENABLED:
         msg = f"⛔️ TRADING DISABLED | blocked BRACKET BUY {symbol}"
@@ -439,8 +497,18 @@ def place_bracket_buy(symbol: str, qty: float, buy_price: float, take_profit_pri
         tg_send(msg)
         return None
 
-    if TakeProfitRequest is None or OrderClass is None:
-        raise RuntimeError("Your installed alpaca-py does not expose TakeProfitRequest/OrderClass (upgrade alpaca-py).")
+    if TakeProfitRequest is None or StopLossRequest is None or OrderClass is None:
+        raise RuntimeError(
+            "Your installed alpaca-py does not expose TakeProfitRequest/StopLossRequest/OrderClass. Upgrade alpaca-py."
+        )
+
+    # Alpaca requires stop < buy for long brackets
+    buy_price = d2(buy_price)
+    take_profit_price = d2(take_profit_price)
+    stop_price = d2(stop_price)
+
+    if stop_price >= buy_price:
+        stop_price = d2(buy_price - MIN_TICK)
 
     req = LimitOrderRequest(
         symbol=symbol,
@@ -450,7 +518,7 @@ def place_bracket_buy(symbol: str, qty: float, buy_price: float, take_profit_pri
         time_in_force=TimeInForce.GTC,
         order_class=OrderClass.BRACKET,
         take_profit=TakeProfitRequest(limit_price=take_profit_price),
-        # stop_loss intentionally omitted (A)
+        stop_loss=StopLossRequest(stop_price=stop_price),
     )
     return trading.submit_order(req)
 
@@ -467,10 +535,7 @@ def extract_take_profit_leg_id(order_obj) -> str:
         for leg in legs:
             try:
                 side = str(getattr(leg, "side", "") or "").lower()
-                typ = str(getattr(leg, "type", "") or "").lower()
                 if side == "sell":
-                    # take-profit is usually a limit sell
-                    # (we don’t overfit; first sell leg is good enough)
                     return str(getattr(leg, "id", "") or "")
             except Exception:
                 continue
@@ -494,7 +559,16 @@ def db_get_lot(conn, symbol: str, buy_level: float):
         return cur.fetchone()
 
 
-def db_upsert_lot(conn, symbol: str, buy_level: float, sell_level: float, qty: float, state: str, buy_order_id=None, sell_order_id=None):
+def db_upsert_lot(
+    conn,
+    symbol: str,
+    buy_level: float,
+    sell_level: float,
+    qty: float,
+    state: str,
+    buy_order_id=None,
+    sell_order_id=None,
+):
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -602,7 +676,6 @@ def reconcile_lots(conn, symbol: str, open_orders):
             fq = order_filled_qty(o) if o else 0.0
 
             if fq > 0.0:
-                # ✅ If this was a bracket, try to capture the TP leg id and move to sell_open
                 tp_leg_id = ""
                 try:
                     tp_leg_id = extract_take_profit_leg_id(o)
@@ -611,27 +684,32 @@ def reconcile_lots(conn, symbol: str, open_orders):
 
                 if tp_leg_id:
                     db_upsert_lot(
-                        conn, symbol,
-                        float(lot["buy_level"]), float(lot["sell_level"]), float(fq),
+                        conn,
+                        symbol,
+                        float(lot["buy_level"]),
+                        float(lot["sell_level"]),
+                        float(fq),
                         "sell_open",
                         buy_order_id=str(buy_oid),
                         sell_order_id=str(tp_leg_id),
                     )
                     log.info(f"🧠 {symbol} reconcile: BUY filled_qty={fq} -> BRACKET TP leg detected -> sell_open")
                 else:
-                    # fallback: treat as owned (then your normal SELL section can handle it)
                     db_upsert_lot(
-                        conn, symbol,
-                        float(lot["buy_level"]), float(lot["sell_level"]), float(fq),
+                        conn,
+                        symbol,
+                        float(lot["buy_level"]),
+                        float(lot["sell_level"]),
+                        float(fq),
                         "owned",
-                        buy_order_id=str(buy_oid), sell_order_id=None
+                        buy_order_id=str(buy_oid),
+                        sell_order_id=None,
                     )
                     if st and st != "filled":
                         log.warning(f"🟠 {symbol} reconcile: BUY {buy_oid} status={st} but filled_qty={fq} -> keeping as owned")
 
             elif st == "filled":
                 fallback_qty = lot_qty_float(lot)
-                # same bracket attempt
                 tp_leg_id = ""
                 try:
                     tp_leg_id = extract_take_profit_leg_id(o)
@@ -640,8 +718,11 @@ def reconcile_lots(conn, symbol: str, open_orders):
 
                 if tp_leg_id:
                     db_upsert_lot(
-                        conn, symbol,
-                        float(lot["buy_level"]), float(lot["sell_level"]), float(fallback_qty),
+                        conn,
+                        symbol,
+                        float(lot["buy_level"]),
+                        float(lot["sell_level"]),
+                        float(fallback_qty),
                         "sell_open",
                         buy_order_id=str(buy_oid),
                         sell_order_id=str(tp_leg_id),
@@ -649,10 +730,14 @@ def reconcile_lots(conn, symbol: str, open_orders):
                     log.info(f"🧠 {symbol} reconcile: BUY status=filled -> BRACKET TP leg -> sell_open")
                 else:
                     db_upsert_lot(
-                        conn, symbol,
-                        float(lot["buy_level"]), float(lot["sell_level"]), float(fallback_qty),
+                        conn,
+                        symbol,
+                        float(lot["buy_level"]),
+                        float(lot["sell_level"]),
+                        float(fallback_qty),
                         "owned",
-                        buy_order_id=str(buy_oid), sell_order_id=None
+                        buy_order_id=str(buy_oid),
+                        sell_order_id=None,
                     )
 
             elif st in ("canceled", "cancelled", "rejected", "expired"):
@@ -679,20 +764,28 @@ def reconcile_lots(conn, symbol: str, open_orders):
                     db_delete_lot(conn, symbol, float(lot["buy_level"]))
                 else:
                     db_upsert_lot(
-                        conn, symbol,
-                        float(lot["buy_level"]), float(lot["sell_level"]), float(remaining),
+                        conn,
+                        symbol,
+                        float(lot["buy_level"]),
+                        float(lot["sell_level"]),
+                        float(remaining),
                         "owned",
-                        buy_order_id=buy_oid, sell_order_id=None
+                        buy_order_id=buy_oid,
+                        sell_order_id=None,
                     )
                 if st and st not in ("filled",):
                     log.warning(f"🟠 {symbol} reconcile: SELL {sell_oid} status={st} but filled_qty={fq} -> adjusted remaining={remaining}")
 
             elif st in ("canceled", "cancelled", "rejected", "expired"):
                 db_upsert_lot(
-                    conn, symbol,
-                    float(lot["buy_level"]), float(lot["sell_level"]), float(lot_qty),
+                    conn,
+                    symbol,
+                    float(lot["buy_level"]),
+                    float(lot["sell_level"]),
+                    float(lot_qty),
                     "owned",
-                    buy_order_id=buy_oid, sell_order_id=None
+                    buy_order_id=buy_oid,
+                    sell_order_id=None,
                 )
 
             else:
@@ -855,7 +948,8 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
                     o = place_limit(symbol, "sell", sell_qty, float(sell_level))
                     if o:
                         db_upsert_lot(
-                            conn, symbol,
+                            conn,
+                            symbol,
                             float(seeded_lot["buy_level"]),
                             float(seeded_lot["sell_level"]),
                             sell_qty,
@@ -873,12 +967,8 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
                     tg_send(msg)
                     return finish({"symbol": symbol, "action": "error", "reason": "sell_failed"}, last_price)
 
-        # IMPORTANT: We intentionally do NOT place “normal” sells here anymore,
-        # because bracket buys create the TP sell automatically and we reconcile into sell_open.
-        # This avoids duplicate/competing sells that can trigger wash-trade rules.
-
     # =========================
-    # 2) BUY (BRACKET: buy + take-profit sell)
+    # 2) BUY (BRACKET: buy + take-profit + WIDE stop-loss)
     # =========================
     if buy_level is not None:
         buy_qty = math.floor(order_usd / float(buy_level))
@@ -906,15 +996,16 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
         # If a BUY already exists at this exact level, skip
         if not has_open_order_at(open_orders, "buy", buy_level):
             try:
-                # ✅ BRACKET BUY (A): parent BUY + child TAKE-PROFIT sell
-                o = place_bracket_buy(symbol, buy_qty, float(buy_level), float(sell_target))
+                stop_price = compute_wide_stop_price(float(buy_level), lower_band=lower)
+
+                o = place_bracket_buy(symbol, buy_qty, float(buy_level), float(sell_target), float(stop_price))
                 if o:
                     tp_leg_id = extract_take_profit_leg_id(o)
 
-                    # We track as buy_open first; reconcile will flip to sell_open once filled.
-                    # (If TP leg id is visible now, we store it immediately.)
+                    # Track as buy_open first; reconcile flips after fill.
                     db_upsert_lot(
-                        conn, symbol,
+                        conn,
+                        symbol,
                         float(buy_level),
                         float(sell_target),
                         buy_qty,
@@ -923,7 +1014,12 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
                         sell_order_id=(tp_leg_id or None),
                     )
 
-                    msg = f"🟢 BUY (BRACKET TP) | {symbol}\nQty: {buy_qty} @ {float(buy_level):.2f} | TP @ {float(sell_target):.2f}"
+                    msg = (
+                        f"🟢 BUY (BRACKET) | {symbol}\n"
+                        f"Qty: {buy_qty} @ {float(buy_level):.2f}\n"
+                        f"TP: {float(sell_target):.2f}\n"
+                        f"SL (wide): {float(stop_price):.2f}  (pct={STOP_LOSS_PCT:.2%})"
+                    )
                     log.info(msg.replace("\n", " | "))
                     tg_send(msg)
 
@@ -934,6 +1030,8 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
                             "qty": buy_qty,
                             "price": float(buy_level),
                             "take_profit": float(sell_target),
+                            "stop_loss": float(stop_price),
+                            "stop_loss_pct": float(STOP_LOSS_PCT),
                             "bracket": True,
                         },
                         last_price,
@@ -1043,7 +1141,7 @@ def telegram_webhook():
             return "ok", 200
 
         if msg.strip().lower() == "/status":
-            lines = [f"🦁 Leo status | Paper={PAPER} | TradingEnabled={TRADING_ENABLED}"]
+            lines = [f"🦁 Leo status | Paper={PAPER} | TradingEnabled={TRADING_ENABLED} | SL_PCT={STOP_LOSS_PCT:.2%}"]
             for sym, cfg in BOTS.items():
                 p = get_last_price(sym)
                 pos = get_position_qty(sym)
@@ -1061,6 +1159,6 @@ def telegram_webhook():
 if __name__ == "__main__":
     init_db()
     log.info(f"🦁 Leo started ({'Paper' if PAPER else 'Live'} Trading)")
-    tg_send(f"🦁 Leo started ({'Paper' if PAPER else 'Live'} Trading)")
+    tg_send(f"🦁 Leo started ({'Paper' if PAPER else 'Live'} Trading) | SL_PCT={STOP_LOSS_PCT:.2%}")
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
