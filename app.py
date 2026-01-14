@@ -1,3 +1,6 @@
+# Leo Grid Bot v4.1.1
+# Minimal fix: BUY-side reconcile fallback uses position truth when Alpaca parent BUY order is missing.
+
 import os
 import math
 import logging
@@ -700,6 +703,9 @@ def reconcile_lots(conn, symbol: str, open_orders):
       - Telegram alert when TP fills (with PnL)
       - Telegram alert when SL triggers (with PnL)
       - Daily wins counter + PnL accumulation for TP fills
+
+    v4.1.1 fix:
+      - If BUY parent order is missing from Alpaca but position exists, assume buy filled and promote lot.
     """
     open_ids = set()
     for o in open_orders:
@@ -742,128 +748,118 @@ def reconcile_lots(conn, symbol: str, open_orders):
         # -------------------------
         # BUY open -> filled/canceled/unknown (WITH partial-fill truth)
         # -------------------------
-# -------------------------
-# BUY open -> filled/canceled/unknown (WITH partial-fill truth)
-# -------------------------
-if state == "buy_open" and buy_oid and str(buy_oid) not in open_ids:
-    o = lookup_order_truth(str(buy_oid))
-    st = order_status_string(o) if o else ""
-    fq = order_filled_qty(o) if o else 0.0
+        if state == "buy_open" and buy_oid and str(buy_oid) not in open_ids:
+            o = lookup_order_truth(str(buy_oid))
+            st = order_status_string(o) if o else ""
+            fq = order_filled_qty(o) if o else 0.0
 
-    if fq > 0.0:
-        tp_leg_id = ""
-        try:
-            tp_leg_id = extract_take_profit_leg_id(o)
-        except Exception:
-            tp_leg_id = ""
+            if fq > 0.0:
+                tp_leg_id = ""
+                try:
+                    tp_leg_id = extract_take_profit_leg_id(o)
+                except Exception:
+                    tp_leg_id = ""
 
-        if tp_leg_id:
-            db_upsert_lot(
-                conn,
-                symbol,
-                float(lot["buy_level"]),
-                float(lot["sell_level"]),
-                float(fq),
-                "sell_open",
-                buy_order_id=str(buy_oid),
-                sell_order_id=str(tp_leg_id),
-            )
-            log.info(
-                f"🧠 {symbol} reconcile: BUY filled_qty={fq} -> BRACKET TP leg detected -> sell_open"
-            )
-        else:
-            db_upsert_lot(
-                conn,
-                symbol,
-                float(lot["buy_level"]),
-                float(lot["sell_level"]),
-                float(fq),
-                "owned",
-                buy_order_id=str(buy_oid),
-                sell_order_id=None,
-            )
-            if st and st != "filled":
-                log.warning(
-                    f"🟠 {symbol} reconcile: BUY {buy_oid} status={st} but filled_qty={fq} -> keeping as owned"
-                )
+                if tp_leg_id:
+                    db_upsert_lot(
+                        conn,
+                        symbol,
+                        float(lot["buy_level"]),
+                        float(lot["sell_level"]),
+                        float(fq),
+                        "sell_open",
+                        buy_order_id=str(buy_oid),
+                        sell_order_id=str(tp_leg_id),
+                    )
+                    log.info(f"🧠 {symbol} reconcile: BUY filled_qty={fq} -> BRACKET TP leg detected -> sell_open")
+                else:
+                    db_upsert_lot(
+                        conn,
+                        symbol,
+                        float(lot["buy_level"]),
+                        float(lot["sell_level"]),
+                        float(fq),
+                        "owned",
+                        buy_order_id=str(buy_oid),
+                        sell_order_id=None,
+                    )
+                    if st and st != "filled":
+                        log.warning(f"🟠 {symbol} reconcile: BUY {buy_oid} status={st} but filled_qty={fq} -> keeping as owned")
 
-    elif st == "filled":
-        fallback_qty = lot_qty_float(lot)
-        tp_leg_id = ""
-        try:
-            tp_leg_id = extract_take_profit_leg_id(o)
-        except Exception:
-            tp_leg_id = ""
+            elif st == "filled":
+                fallback_qty = lot_qty_float(lot)
+                tp_leg_id = ""
+                try:
+                    tp_leg_id = extract_take_profit_leg_id(o)
+                except Exception:
+                    tp_leg_id = ""
 
-        if tp_leg_id:
-            db_upsert_lot(
-                conn,
-                symbol,
-                float(lot["buy_level"]),
-                float(lot["sell_level"]),
-                float(fallback_qty),
-                "sell_open",
-                buy_order_id=str(buy_oid),
-                sell_order_id=str(tp_leg_id),
-            )
-            log.info(
-                f"🧠 {symbol} reconcile: BUY status=filled -> BRACKET TP leg -> sell_open"
-            )
-        else:
-            db_upsert_lot(
-                conn,
-                symbol,
-                float(lot["buy_level"]),
-                float(lot["sell_level"]),
-                float(fallback_qty),
-                "owned",
-                buy_order_id=str(buy_oid),
-                sell_order_id=None,
-            )
+                if tp_leg_id:
+                    db_upsert_lot(
+                        conn,
+                        symbol,
+                        float(lot["buy_level"]),
+                        float(lot["sell_level"]),
+                        float(fallback_qty),
+                        "sell_open",
+                        buy_order_id=str(buy_oid),
+                        sell_order_id=str(tp_leg_id),
+                    )
+                    log.info(f"🧠 {symbol} reconcile: BUY status=filled -> BRACKET TP leg -> sell_open")
+                else:
+                    db_upsert_lot(
+                        conn,
+                        symbol,
+                        float(lot["buy_level"]),
+                        float(lot["sell_level"]),
+                        float(fallback_qty),
+                        "owned",
+                        buy_order_id=str(buy_oid),
+                        sell_order_id=None,
+                    )
 
-    elif st in ("canceled", "cancelled", "rejected", "expired"):
-        db_delete_lot(conn, symbol, float(lot["buy_level"]))
+            elif st in ("canceled", "cancelled", "rejected", "expired"):
+                db_delete_lot(conn, symbol, float(lot["buy_level"]))
 
-    elif get_position_qty(symbol) >= lot_qty_float(lot) > 0:
-        expected_qty = lot_qty_float(lot)
+            # ✅ v4.1.1 FIX: position-truth fallback when Alpaca "forgets" the parent buy
+            elif get_position_qty(symbol) > 0:
+                expected_qty = lot_qty_float(lot)
+                if expected_qty <= 0:
+                    expected_qty = get_position_qty(symbol)
 
-        tp_leg_id = ""
-        try:
-            tp_leg_id = extract_take_profit_leg_id(o)
-        except Exception:
-            pass
+                tp_leg_id = ""
+                try:
+                    tp_leg_id = extract_take_profit_leg_id(o)
+                except Exception:
+                    pass
 
-        if tp_leg_id:
-            db_upsert_lot(
-                conn,
-                symbol,
-                float(lot["buy_level"]),
-                float(lot["sell_level"]),
-                expected_qty,
-                "sell_open",
-                buy_order_id=str(buy_oid),
-                sell_order_id=str(tp_leg_id),
-            )
-        else:
-            db_upsert_lot(
-                conn,
-                symbol,
-                float(lot["buy_level"]),
-                float(lot["sell_level"]),
-                expected_qty,
-                "owned",
-                buy_order_id=str(buy_oid),
-                sell_order_id=None,
-            )
+                if tp_leg_id:
+                    db_upsert_lot(
+                        conn,
+                        symbol,
+                        float(lot["buy_level"]),
+                        float(lot["sell_level"]),
+                        float(expected_qty),
+                        "sell_open",
+                        buy_order_id=str(buy_oid),
+                        sell_order_id=str(tp_leg_id),
+                    )
+                else:
+                    db_upsert_lot(
+                        conn,
+                        symbol,
+                        float(lot["buy_level"]),
+                        float(lot["sell_level"]),
+                        float(expected_qty),
+                        "owned",
+                        buy_order_id=str(buy_oid),
+                        sell_order_id=None,
+                    )
 
-        log.info(
-            f"🧠 {symbol} reconcile fallback: BUY assumed filled via position qty={expected_qty}"
-        )
+                log.info(f"🧠 {symbol} reconcile fallback: BUY assumed filled via position qty={expected_qty}")
 
-    else:
-        log.warning(
-            f"🟠 {symbol} reconcile: buy_open order {buy_oid} not open, truth unknown -> keeping lot"
-        )
+            else:
+                log.warning(f"🟠 {symbol} reconcile: buy_open order {buy_oid} not open, truth unknown -> keeping lot")
 
         # -------------------------
         # SELL open -> filled/canceled/unknown (WITH partial-fill truth) + TP/SL ALERTS
@@ -1335,7 +1331,7 @@ def telegram_webhook():
 # =======================
 if __name__ == "__main__":
     init_db()
-    log.info(f"🦁 Leo started ({'Paper' if PAPER else 'Live'} Trading)")
-    tg_send(f"🦁 Leo started ({'Paper' if PAPER else 'Live'} Trading) | SL_PCT={STOP_LOSS_PCT:.2%}")
+    log.info(f"🦁 Leo started v4.1.1 ({'Paper' if PAPER else 'Live'} Trading)")
+    tg_send(f"🦁 Leo started v4.1.1 ({'Paper' if PAPER else 'Live'} Trading) | SL_PCT={STOP_LOSS_PCT:.2%}")
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
