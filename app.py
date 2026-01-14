@@ -50,7 +50,7 @@ log = logging.getLogger("leo")
 # =======================
 BOTS = {
     "GLD": {"lower": 403.28, "upper": 436.84, "grid_pct": 0.004, "order_usd": 2500, "max_capital": 30000},
-    "SLV": {"lower": 70.80, "upper": 81.82, "grid_pct": 0.006, "order_usd": 2500, "max_capital": 30000},
+    "SLV": {"lower": 70.80, "upper": 89.94, "grid_pct": 0.006, "order_usd": 2500, "max_capital": 30000},
     "MARA": {"lower": 9.0, "upper": 16.50, "grid_pct": 0.015, "order_usd": 2500, "max_capital": 30000},
     "MSTR": {"lower": 148.00, "upper": 177.00, "grid_pct": 0.015, "order_usd": 2500, "max_capital": 30000},
     "BTBT": {"lower": 1.87, "upper": 3.37, "grid_pct": 0.015, "order_usd": 2500, "max_capital": 30000},
