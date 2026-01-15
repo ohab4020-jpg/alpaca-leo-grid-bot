@@ -55,6 +55,19 @@ BOTS = {
 
 MIN_TICK = 0.01  # 🔒 minimum price difference to avoid buy/sell at same level
 
+# =======================
+# QTY PRECISION / FRACTIONALS
+# =======================
+# Decision (as requested):
+#   - BUY: whole shares only (stable grid sizing)
+#   - SELL: allow fractional (handles partial fills / seeded positions that may become fractional)
+BUY_WHOLE_SHARES = os.getenv("BUY_WHOLE_SHARES", "true").lower() == "true"
+ALLOW_FRACTIONAL_SELLS = os.getenv("ALLOW_FRACTIONAL_SELLS", "true").lower() == "true"
+
+# Qty step used when we allow fractional sells. Alpaca commonly supports 0.0001 share increments for fractionals.
+QTY_STEP = Decimal(os.getenv("QTY_STEP", "0.0001"))
+
+
 PAPER = os.getenv("PAPER_TRADING", "true").lower() == "true"
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "true").lower() == "true"
 
@@ -123,6 +136,33 @@ app = Flask(__name__)
 def d2(x: float) -> float:
     """Round price to 2 decimals."""
     return float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def normalize_qty(qty: float, *, allow_fractional: bool) -> float:
+    """Normalize quantity for order submission.
+
+    - If allow_fractional=False: return whole shares (floor) and never negative.
+    - If allow_fractional=True: quantize to QTY_STEP.
+
+    Returns a float suitable for alpaca-py (alpaca-py accepts float/str/Decimal depending on version;
+    we keep float here for minimal disruption).
+    """
+    try:
+        q = Decimal(str(qty))
+    except Exception:
+        return 0.0
+
+    if q <= 0:
+        return 0.0
+
+    if not allow_fractional:
+        # Whole shares only
+        return float(int(q))
+
+    step = QTY_STEP if QTY_STEP > 0 else Decimal("0.0001")
+    # Quantize DOWN to step to avoid over-selling.
+    q = (q / step).to_integral_value(rounding="ROUND_FLOOR") * step
+    return float(q)
 
 
 def now_utc() -> datetime:
@@ -197,12 +237,20 @@ def init_db():
                     qty NUMERIC NOT NULL,
                     state TEXT NOT NULL, -- buy_open | owned | sell_open
                     buy_order_id TEXT,
+                    -- For bracket orders we store BOTH child legs (TP + SL). For non-bracket sells,
+                    -- we keep using sell_order_id.
                     sell_order_id TEXT,
+                    tp_order_id TEXT,
+                    sl_order_id TEXT,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     PRIMARY KEY(symbol, buy_level)
                 );
             """
             )
+
+            # Backwards-compatible migrations for existing databases
+            cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS tp_order_id TEXT;")
+            cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS sl_order_id TEXT;")
 
         conn.commit()
         log.info("✅ Postgres initialized")
@@ -753,25 +801,52 @@ def place_bracket_buy(symbol: str, qty: float, buy_price: float, take_profit_pri
     return trading.submit_order(req)
 
 
-def extract_take_profit_leg_id(order_obj) -> str:
+def extract_bracket_leg_ids(order_obj):
+    """Return (tp_leg_id, sl_leg_id) for a BRACKET parent order.
+
+    Alpaca bracket parents commonly include a ``legs`` list. We identify:
+      - take-profit leg: SELL + type == LIMIT
+      - stop-loss leg: SELL + type contains STOP
+
+    Returns empty strings if not found.
     """
-    Best-effort: Alpaca bracket parent may return legs.
-    We try to find the SELL leg (take-profit) ID.
-    """
+    tp_id, sl_id = "", ""
     if not order_obj:
-        return ""
+        return tp_id, sl_id
+
     try:
         legs = getattr(order_obj, "legs", None) or []
-        for leg in legs:
-            try:
-                side = str(getattr(leg, "side", "") or "").lower()
-                if side == "sell":
-                    return str(getattr(leg, "id", "") or "")
-            except Exception:
-                continue
     except Exception:
-        pass
-    return ""
+        legs = []
+
+    for leg in legs or []:
+        try:
+            side = str(getattr(leg, "side", "") or "").lower()
+            if side != "sell":
+                continue
+            leg_id = str(getattr(leg, "id", "") or "")
+            typ = str(getattr(leg, "type", "") or "").lower()
+
+            if "stop" in typ:
+                if not sl_id:
+                    sl_id = leg_id
+            elif typ == "limit":
+                if not tp_id:
+                    tp_id = leg_id
+            else:
+                # Fallback: if we have neither, treat first SELL as TP to preserve old behavior.
+                if not tp_id:
+                    tp_id = leg_id
+        except Exception:
+            continue
+
+    return tp_id, sl_id
+
+
+def extract_take_profit_leg_id(order_obj) -> str:
+    """Backward-compatible helper: returns TP leg ID if available."""
+    tp_id, _ = extract_bracket_leg_ids(order_obj)
+    return tp_id
 
 
 # =======================
@@ -798,12 +873,14 @@ def db_upsert_lot(
     state: str,
     buy_order_id=None,
     sell_order_id=None,
+    tp_order_id=None,
+    sl_order_id=None,
 ):
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO grid_lots(symbol, buy_level, sell_level, qty, state, buy_order_id, sell_order_id, updated_at)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,now())
+            INSERT INTO grid_lots(symbol, buy_level, sell_level, qty, state, buy_order_id, sell_order_id, tp_order_id, sl_order_id, updated_at)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
             ON CONFLICT(symbol, buy_level)
             DO UPDATE SET
                 sell_level=EXCLUDED.sell_level,
@@ -811,9 +888,11 @@ def db_upsert_lot(
                 state=EXCLUDED.state,
                 buy_order_id=COALESCE(EXCLUDED.buy_order_id, grid_lots.buy_order_id),
                 sell_order_id=COALESCE(EXCLUDED.sell_order_id, grid_lots.sell_order_id),
+                tp_order_id=COALESCE(EXCLUDED.tp_order_id, grid_lots.tp_order_id),
+                sl_order_id=COALESCE(EXCLUDED.sl_order_id, grid_lots.sl_order_id),
                 updated_at=now();
         """,
-            (symbol, d2(buy_level), d2(sell_level), float(qty), state, buy_order_id, sell_order_id),
+            (symbol, d2(buy_level), d2(sell_level), float(qty), state, buy_order_id, sell_order_id, tp_order_id, sl_order_id),
         )
 
 
@@ -904,6 +983,8 @@ def reconcile_lots(conn, symbol: str, open_orders):
         state = lot["state"]
         buy_oid = lot.get("buy_order_id")
         sell_oid = lot.get("sell_order_id")
+        tp_oid = lot.get("tp_order_id") or ""
+        sl_oid = lot.get("sl_order_id") or ""
 
         # -------------------------
         # BUY open -> filled/canceled/unknown (WITH partial-fill truth)
@@ -914,13 +995,13 @@ def reconcile_lots(conn, symbol: str, open_orders):
             fq = order_filled_qty(o) if o else 0.0
 
             if fq > 0.0:
-                tp_leg_id = ""
+                tp_leg_id, sl_leg_id = ("", "")
                 try:
-                    tp_leg_id = extract_take_profit_leg_id(o)
+                    tp_leg_id, sl_leg_id = extract_bracket_leg_ids(o)
                 except Exception:
-                    tp_leg_id = ""
+                    tp_leg_id, sl_leg_id = ("", "")
 
-                if tp_leg_id:
+                if tp_leg_id or sl_leg_id:
                     db_upsert_lot(
                         conn,
                         symbol,
@@ -929,9 +1010,12 @@ def reconcile_lots(conn, symbol: str, open_orders):
                         float(fq),
                         "sell_open",
                         buy_order_id=str(buy_oid),
-                        sell_order_id=str(tp_leg_id),
+                        # Backwards-compat: keep sell_order_id pointing at TP when available
+                        sell_order_id=str(tp_leg_id) if tp_leg_id else None,
+                        tp_order_id=str(tp_leg_id) if tp_leg_id else None,
+                        sl_order_id=str(sl_leg_id) if sl_leg_id else None,
                     )
-                    log.info(f"🧠 {symbol} reconcile: BUY filled_qty={fq} -> BRACKET TP leg detected -> sell_open")
+                    log.info(f"🧠 {symbol} reconcile: BUY filled_qty={fq} -> BRACKET legs detected -> sell_open")
                 else:
                     db_upsert_lot(
                         conn,
@@ -948,13 +1032,13 @@ def reconcile_lots(conn, symbol: str, open_orders):
 
             elif st == "filled":
                 fallback_qty = lot_qty_float(lot)
-                tp_leg_id = ""
+                tp_leg_id, sl_leg_id = ("", "")
                 try:
-                    tp_leg_id = extract_take_profit_leg_id(o)
+                    tp_leg_id, sl_leg_id = extract_bracket_leg_ids(o)
                 except Exception:
-                    tp_leg_id = ""
+                    tp_leg_id, sl_leg_id = ("", "")
 
-                if tp_leg_id:
+                if tp_leg_id or sl_leg_id:
                     db_upsert_lot(
                         conn,
                         symbol,
@@ -963,9 +1047,11 @@ def reconcile_lots(conn, symbol: str, open_orders):
                         float(fallback_qty),
                         "sell_open",
                         buy_order_id=str(buy_oid),
-                        sell_order_id=str(tp_leg_id),
+                        sell_order_id=str(tp_leg_id) if tp_leg_id else None,
+                        tp_order_id=str(tp_leg_id) if tp_leg_id else None,
+                        sl_order_id=str(sl_leg_id) if sl_leg_id else None,
                     )
-                    log.info(f"🧠 {symbol} reconcile: BUY status=filled -> BRACKET TP leg -> sell_open")
+                    log.info(f"🧠 {symbol} reconcile: BUY status=filled -> BRACKET legs -> sell_open")
                 else:
                     db_upsert_lot(
                         conn,
@@ -987,13 +1073,13 @@ def reconcile_lots(conn, symbol: str, open_orders):
                 if expected_qty <= 0:
                     expected_qty = get_position_qty(symbol)
 
-                tp_leg_id = ""
+                tp_leg_id, sl_leg_id = ("", "")
                 try:
-                    tp_leg_id = extract_take_profit_leg_id(o)
+                    tp_leg_id, sl_leg_id = extract_bracket_leg_ids(o)
                 except Exception:
-                    pass
+                    tp_leg_id, sl_leg_id = ("", "")
 
-                if tp_leg_id:
+                if tp_leg_id or sl_leg_id:
                     db_upsert_lot(
                         conn,
                         symbol,
@@ -1002,7 +1088,9 @@ def reconcile_lots(conn, symbol: str, open_orders):
                         float(expected_qty),
                         "sell_open",
                         buy_order_id=str(buy_oid),
-                        sell_order_id=str(tp_leg_id),
+                        sell_order_id=str(tp_leg_id) if tp_leg_id else None,
+                        tp_order_id=str(tp_leg_id) if tp_leg_id else None,
+                        sl_order_id=str(sl_leg_id) if sl_leg_id else None,
                     )
                 else:
                     db_upsert_lot(
@@ -1028,15 +1116,58 @@ def reconcile_lots(conn, symbol: str, open_orders):
         # -------------------------
         # SELL open -> filled/canceled/unknown (WITH partial-fill truth) + TP/SL ALERTS
         # -------------------------
-        if state == "sell_open" and sell_oid and str(sell_oid) not in open_ids:
-            o = lookup_order_truth(str(sell_oid))
+        # -------------------------
+        # SELL open -> filled/canceled/unknown (BRACKET-AWARE: TP vs SL)
+        # -------------------------
+        # If we stored bracket legs, we treat the lot as "sell_open" while EITHER leg is open.
+        # Once both legs are no longer open, we determine which leg filled (TP vs SL).
+        tracked_sell_ids = []
+        if tp_oid or sl_oid:
+            if tp_oid:
+                tracked_sell_ids.append(str(tp_oid))
+            if sl_oid:
+                tracked_sell_ids.append(str(sl_oid))
+        elif sell_oid:
+            tracked_sell_ids.append(str(sell_oid))
+
+        any_leg_open = any((oid and str(oid) in open_ids) for oid in tracked_sell_ids)
+
+        if state == "sell_open" and tracked_sell_ids and not any_leg_open:
+            # Prefer a filled leg if we can find one.
+            leg_truth = []
+            for oid in tracked_sell_ids:
+                oo = lookup_order_truth(str(oid))
+                leg_truth.append((oid, oo, order_status_string(oo) if oo else "", order_filled_qty(oo) if oo else 0.0))
+
+            filled_leg = next((t for t in leg_truth if t[2] == "filled"), None)
+            # If none says filled but some has filled_qty > 0, treat that as the one to process.
+            if filled_leg is None:
+                filled_leg = next((t for t in leg_truth if (t[3] or 0.0) > 0.0), None)
+
+            # If still nothing, fall back to first leg.
+            oid_used, o, st, fq = ("", None, "", 0.0)
+            if filled_leg is not None:
+                oid_used, o, st, fq = filled_leg
+            else:
+                oid_used, o, st, fq = leg_truth[0]
+
             st = order_status_string(o) if o else ""
             fq = order_filled_qty(o) if o else 0.0
             lot_qty = lot_qty_float(lot)
 
             if st == "filled":
-                # ✅ NEW: classify TP vs SL, compute PnL, alert Telegram, record daily wins on TP
-                fill_type = classify_sell_fill(o)
+                # ✅ classify TP vs SL:
+                # - If we tracked both legs, use which id filled as primary signal.
+                # - Else fall back to order type (stop vs limit).
+                if tp_oid or sl_oid:
+                    if sl_oid and str(oid_used) == str(sl_oid):
+                        fill_type = "sl"
+                    elif tp_oid and str(oid_used) == str(tp_oid):
+                        fill_type = "tp"
+                    else:
+                        fill_type = classify_sell_fill(o)
+                else:
+                    fill_type = classify_sell_fill(o)
 
                 buy_level = float(lot["buy_level"])
                 target_level = float(lot["sell_level"])
@@ -1092,9 +1223,11 @@ def reconcile_lots(conn, symbol: str, open_orders):
                         "owned",
                         buy_order_id=buy_oid,
                         sell_order_id=None,
+                        tp_order_id=None,
+                        sl_order_id=None,
                     )
                 if st and st not in ("filled",):
-                    log.warning(f"🟠 {symbol} reconcile: SELL {sell_oid} status={st} but filled_qty={fq} -> adjusted remaining={remaining}")
+                    log.warning(f"🟠 {symbol} reconcile: SELL {oid_used} status={st} but filled_qty={fq} -> adjusted remaining={remaining}")
 
             elif st in ("canceled", "cancelled", "rejected", "expired"):
                 db_upsert_lot(
@@ -1106,6 +1239,8 @@ def reconcile_lots(conn, symbol: str, open_orders):
                     "owned",
                     buy_order_id=buy_oid,
                     sell_order_id=None,
+                    tp_order_id=None,
+                    sl_order_id=None,
                 )
 
             else:
@@ -1124,9 +1259,11 @@ def reconcile_lots(conn, symbol: str, open_orders):
                         "owned",
                         buy_order_id=buy_oid,
                         sell_order_id=None,
+                        tp_order_id=None,
+                        sl_order_id=None,
                     )
                     log.info(
-                        f"🧠 {symbol} reconcile auto-heal: phantom SELL {sell_oid} cleared via position qty={expected_qty}"
+                        f"🧠 {symbol} reconcile auto-heal: phantom SELL legs {tracked_sell_ids} cleared via position qty={expected_qty}"
                     )
                     try:
                         record_auto_heal(conn, symbol, 'phantom_sell_cleared')
@@ -1135,13 +1272,13 @@ def reconcile_lots(conn, symbol: str, open_orders):
                 elif o is None and pos_qty <= 0.0:
                     # No shares => lot is dead; remove the stale memory.
                     db_delete_lot(conn, symbol, float(lot["buy_level"]))
-                    log.info(f"🧹 {symbol} reconcile auto-heal: removed stale lot (no position, missing SELL {sell_oid})")
+                    log.info(f"🧹 {symbol} reconcile auto-heal: removed stale lot (no position, missing SELL legs {tracked_sell_ids})")
                     try:
                         record_auto_heal(conn, symbol, 'stale_lot_removed')
                     except Exception:
                         pass
                 else:
-                    log.warning(f"🟠 {symbol} reconcile: sell_open order {sell_oid} not open, truth unknown -> keeping lot")
+                    log.warning(f"🟠 {symbol} reconcile: sell_open legs {tracked_sell_ids} not open, truth unknown -> keeping lot")
 
 
 # =======================
@@ -1186,25 +1323,33 @@ def maybe_daily_summary(conn):
     day = utc_day()
     hour = now_utc().hour
 
-    if hour < DAILY_SUMMARY_HOUR_UTC:
-        return
-
+    # Ensure the baseline rows exist for the UTC day (00:00 UTC baseline concept).
+    # We store the first equity we see for the day as the baseline. This is not perfect
+    # if the process is down around midnight, but it's consistent and truly "daily".
     equity = get_account_equity()
 
     with conn.cursor() as cur:
-        # ---- equity summary (existing) ----
+        cur.execute("SELECT 1 FROM daily_equity WHERE day=%s;", (day,))
+        if cur.fetchone() is None:
+            cur.execute(
+                "INSERT INTO daily_equity(day, start_equity, summary_sent) VALUES(%s, %s, false);",
+                (day, equity),
+            )
+            cur.execute(
+                "INSERT INTO daily_wins(day, wins, wins_pnl, summary_sent) VALUES(%s, 0, 0, false) ON CONFLICT(day) DO NOTHING;",
+                (day,),
+            )
+            conn.commit()
+
+    if hour < DAILY_SUMMARY_HOUR_UTC:
+        return
+
+    with conn.cursor() as cur:
+        # ---- equity summary ----
         cur.execute("SELECT * FROM daily_equity WHERE day=%s;", (day,))
         row = cur.fetchone()
 
-        if row is None:
-            cur.execute("INSERT INTO daily_equity(day, start_equity, summary_sent) VALUES(%s, %s, false);", (day, equity))
-            conn.commit()
-            # also ensure daily_wins exists
-            cur.execute("INSERT INTO daily_wins(day, wins, wins_pnl, summary_sent) VALUES(%s, 0, 0, false) ON CONFLICT(day) DO NOTHING;", (day,))
-            conn.commit()
-            return
-
-        if not row["summary_sent"]:
+        if row and not row["summary_sent"]:
             start_equity = float(row["start_equity"])
             pnl = equity - start_equity
 
@@ -1215,14 +1360,9 @@ def maybe_daily_summary(conn):
             cur.execute("UPDATE daily_equity SET summary_sent=true WHERE day=%s;", (day,))
             conn.commit()
 
-        # ---- wins summary (NEW) ----
+        # ---- wins summary ----
         wins_row = db_get_daily_wins(conn, day)
-        if wins_row is None:
-            cur.execute("INSERT INTO daily_wins(day, wins, wins_pnl, summary_sent) VALUES(%s, 0, 0, false);", (day,))
-            conn.commit()
-            return
-
-        if not wins_row["summary_sent"]:
+        if wins_row and not wins_row["summary_sent"]:
             wins = int(wins_row["wins"])
             wins_pnl = float(wins_row["wins_pnl"])
 
@@ -1321,8 +1461,9 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
     if sell_level is not None:
         seeded_lot = db_get_seeded_lot_for_sell_level(conn, symbol, sell_level)
         if seeded_lot:
-            seeded_qty = math.floor(float(seeded_lot["qty"]))
-            sell_qty = min(seeded_qty, math.floor(free_qty))
+            seeded_qty = float(seeded_lot["qty"])  # may be fractional
+            max_sell = min(seeded_qty, float(free_qty))
+            sell_qty = normalize_qty(max_sell, allow_fractional=ALLOW_FRACTIONAL_SELLS)
             if sell_qty > 0 and not has_open_order_at(open_orders, "sell", sell_level):
                 try:
                     o = place_limit(symbol, "sell", sell_qty, float(sell_level))
@@ -1355,7 +1496,8 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
     # 2) BUY (BRACKET: buy + take-profit + WIDE stop-loss)
     # =========================
     if buy_level is not None:
-        buy_qty = math.floor(order_usd / float(buy_level))
+        raw_qty = order_usd / float(buy_level)
+        buy_qty = normalize_qty(raw_qty, allow_fractional=not BUY_WHOLE_SHARES)
         if buy_qty <= 0:
             return finish({"symbol": symbol, "action": "none", "reason": "buy_qty_zero"}, last_price)
 
@@ -1364,7 +1506,7 @@ def run_symbol(conn, symbol: str, cfg: dict, allow_new_order: bool = True):
             log.info(f"🟡 {symbol} already has memory at buy_level={float(buy_level):.2f} (state={existing['state']}), skipping BUY")
             return finish({"symbol": symbol, "action": "none", "reason": "level_already_tracked", "buy_level": float(buy_level), "price": last_price}, last_price)
 
-        projected = used + (buy_qty * float(buy_level))
+        projected = used + (float(buy_qty) * float(buy_level))
         if projected > max_capital:
             log.info(f"🟠 {symbol} BUY blocked (capital) used≈${used:,.2f} projected≈${projected:,.2f} max=${max_capital:,.2f}")
             try:
