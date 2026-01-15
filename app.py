@@ -49,8 +49,8 @@ log = logging.getLogger("leo")
 # CONFIG (EDIT THIS)
 # =======================
 BOTS = {
-    "GLD": {"lower": 404.66, "upper": 440.74, "grid_pct": 0.004, "order_usd": 2500, "max_capital": 30000},
-    "SLV": {"lower": 67.74, "upper": 92.06, "grid_pct": 0.006, "order_usd": 2500, "max_capital": 30000},
+    "GLD": {"lower": 404.66, "upper": 440.74, "grid_pct": 0.004, "order_usd": 5000, "max_capital": 50000},
+    "SLV": {"lower": 67.74, "upper": 92.06, "grid_pct": 0.006, "order_usd": 5000, "max_capital": 50000},
 }
 
 MIN_TICK = 0.01  # 🔒 minimum price difference to avoid buy/sell at same level
