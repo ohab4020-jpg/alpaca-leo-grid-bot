@@ -49,16 +49,8 @@ log = logging.getLogger("leo")
 # CONFIG (EDIT THIS)
 # =======================
 BOTS = {
-    "GLD": {"lower": 403.28, "upper": 436.84, "grid_pct": 0.004, "order_usd": 2500, "max_capital": 30000},
-    "SLV": {"lower": 70.80, "upper": 89.94, "grid_pct": 0.006, "order_usd": 2500, "max_capital": 30000},
-    "MARA": {"lower": 9.0, "upper": 16.50, "grid_pct": 0.015, "order_usd": 2500, "max_capital": 30000},
-    "MSTR": {"lower": 165.00, "upper": 247.74, "grid_pct": 0.015, "order_usd": 2500, "max_capital": 30000},
-    "BTBT": {"lower": 1.87, "upper": 3.37, "grid_pct": 0.015, "order_usd": 2500, "max_capital": 30000},
-    "RSP": {"lower": 191.15, "upper": 204.76, "grid_pct": 0.005, "order_usd": 2500, "max_capital": 30000},
-    "GOOG": {"lower": 295.00, "upper": 360.96, "grid_pct": 0.005, "order_usd": 2500, "max_capital": 30000},
-    "AAPL": {"lower": 250.00, "upper": 298.00, "grid_pct": 0.005, "order_usd": 2500, "max_capital": 30000},
-    "MSFT": {"lower": 446.00, "upper": 526.00, "grid_pct": 0.005, "order_usd": 2500, "max_capital": 30000},
-    "AMZN": {"lower": 200.00, "upper": 265.96, "grid_pct": 0.005, "order_usd": 2500, "max_capital": 30000},
+    "GLD": {"lower": 404.66, "upper": 440.74, "grid_pct": 0.004, "order_usd": 2500, "max_capital": 30000},
+    "SLV": {"lower": 67.74, "upper": 92.06, "grid_pct": 0.006, "order_usd": 2500, "max_capital": 30000},
 }
 
 MIN_TICK = 0.01  # 🔒 minimum price difference to avoid buy/sell at same level
