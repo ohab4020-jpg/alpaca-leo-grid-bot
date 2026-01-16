@@ -96,6 +96,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Reporting-only baseline capital (never used for trading decisions)
+BASELINE_CAPITAL = float(os.getenv("BASELINE_CAPITAL", "50000"))
+
 # Send daily summary after this UTC hour (0-23). (Example: 20 = 20:00 UTC)
 DAILY_SUMMARY_HOUR_UTC = int(os.getenv("DAILY_SUMMARY_HOUR_UTC", "20"))
 
@@ -255,6 +258,138 @@ def tg_send(text: str) -> None:
         log.warning(f"Telegram send failed: {e}")
 
 
+# =======================
+# TELEGRAM OUTBOX (EXACTLY-ONCE) + PNL PERSISTENCE
+# =======================
+
+# Notes:
+# - We keep tg_send() as the low-level sender for non-critical/legacy alerts.
+# - For lot-closing alerts and strategy summaries we use a DB-backed outbox
+#   (telegram_events) to guarantee exactly-once even across restarts.
+
+def tg_enqueue_event(conn, event_id: str, kind: str, text: str) -> bool:
+    """Insert an event into telegram_events.
+
+    Returns True if inserted (i.e., not already present).
+    """
+    if not tg_enabled() or not event_id:
+        return False
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO telegram_events(event_id, kind, text, sent)
+            VALUES(%s, %s, %s, false)
+            ON CONFLICT(event_id) DO NOTHING;
+            """,
+            (event_id, kind, text),
+        )
+        return cur.rowcount == 1
+
+
+def tg_flush_outbox(conn, limit: int = 25) -> None:
+    """Attempt to send unsent telegram events."""
+    if not tg_enabled():
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT event_id, text
+                FROM telegram_events
+                WHERE sent=false
+                ORDER BY created_at ASC
+                LIMIT %s;
+                """,
+                (int(limit),),
+            )
+            rows = cur.fetchall() or []
+
+        for r in rows:
+            eid = str(r.get('event_id') or '')
+            msg = str(r.get('text') or '')
+            if not eid or not msg:
+                continue
+            try:
+                tg_send(msg)
+                with conn.cursor() as cur2:
+                    cur2.execute(
+                        "UPDATE telegram_events SET sent=true, sent_at=now() WHERE event_id=%s AND sent=false;",
+                        (eid,),
+                    )
+                conn.commit()
+            except Exception as e:
+                # Leave unsent for next run
+                conn.rollback()
+                log.warning(f"Telegram outbox send failed for {eid}: {e}")
+                break
+    except Exception as e:
+        log.warning(f"Telegram outbox flush failed: {e}")
+
+
+def strategy_get_cum_realized_pnl(conn) -> float:
+    return db_get_state_float(conn, 'strategy:cumulative_realized_pnl_usd', 0.0)
+
+
+def strategy_add_realized_pnl(conn, delta_usd: float) -> float:
+    curr = strategy_get_cum_realized_pnl(conn)
+    curr = float(curr) + float(delta_usd)
+    db_set_state(conn, 'strategy:cumulative_realized_pnl_usd', str(curr))
+    return curr
+
+
+def build_strategy_performance_text(conn) -> str:
+    baseline = float(BASELINE_CAPITAL) if float(BASELINE_CAPITAL) > 0 else 0.0
+    cum = strategy_get_cum_realized_pnl(conn)
+    net = baseline + cum
+    pct = (cum / baseline * 100.0) if baseline > 0 else 0.0
+    return (
+        'STRATEGY PERFORMANCE (Realized)\n'
+        f'Baseline: ${baseline:,.2f}\n'
+        f'Cumulative realized PnL: ${cum:,.2f}\n'
+        f'Net strategy equity: ${net:,.2f}\n'
+        f'Return vs baseline: {pct:+.2f}%'
+    )
+
+
+def tg_send_strategy_performance(conn, reason: str = '') -> None:
+    eid = f"strategy_perf:{utc_day().isoformat()}:{reason or 'manual'}"
+    txt = build_strategy_performance_text(conn)
+    tg_enqueue_event(conn, eid, 'strategy', txt)
+
+
+def db_mark_lot_closed_once(
+    conn,
+    symbol: str,
+    buy_level: float,
+    outcome: str,
+    qty: float,
+    entry_px: float,
+    exit_px: float,
+    pnl_usd: float,
+    pnl_pct: float,
+    close_order_id: str = '',
+) -> bool:
+    """Persist a lot closure record. Returns True only the first time."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO lot_closures(symbol, buy_level, outcome, qty, entry_px, exit_px, pnl_usd, pnl_pct, close_order_id, closed_at)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+            ON CONFLICT(symbol, buy_level) DO NOTHING;
+            """,
+            (
+                symbol,
+                d2(float(buy_level)),
+                str(outcome),
+                float(qty),
+                float(entry_px),
+                float(exit_px),
+                float(pnl_usd),
+                float(pnl_pct),
+                str(close_order_id or ''),
+            ),
+        )
+        return cur.rowcount == 1
 def pg_conn():
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     conn.autocommit = False
@@ -301,6 +436,37 @@ def init_db():
 
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS telegram_events (
+                    event_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    sent BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    sent_at TIMESTAMPTZ
+                );
+            """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lot_closures (
+                    symbol TEXT NOT NULL,
+                    buy_level NUMERIC NOT NULL,
+                    outcome TEXT NOT NULL,
+                    qty NUMERIC NOT NULL,
+                    entry_px NUMERIC NOT NULL,
+                    exit_px NUMERIC NOT NULL,
+                    pnl_usd NUMERIC NOT NULL,
+                    pnl_pct NUMERIC NOT NULL,
+                    close_order_id TEXT,
+                    closed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY(symbol, buy_level)
+                );
+            """
+            )
+
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS grid_lots (
                     symbol TEXT NOT NULL,
                     buy_level NUMERIC NOT NULL,
@@ -311,6 +477,7 @@ def init_db():
                     sell_order_id TEXT,
                     tp_order_id TEXT,
                     sl_order_id TEXT,
+                    buy_fill_px NUMERIC,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     PRIMARY KEY(symbol, buy_level)
                 );
@@ -323,6 +490,7 @@ def init_db():
             cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS sell_order_id TEXT;")
             cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS tp_order_id TEXT;")
             cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS sl_order_id TEXT;")
+            cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS buy_fill_px NUMERIC;")
             cur.execute("ALTER TABLE grid_lots ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();")
 
             # If someone created a minimal grid_lots table, ensure required columns exist.
@@ -929,11 +1097,12 @@ def db_upsert_lot(
     sell_order_id=None,
     tp_order_id=None,
     sl_order_id=None,
+    buy_fill_px=None,
 ):
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO grid_lots(symbol, buy_level, sell_level, qty, state, buy_order_id, sell_order_id, tp_order_id, sl_order_id, updated_at)
+            INSERT INTO grid_lots(symbol, buy_level, sell_level, qty, state, buy_order_id, sell_order_id, tp_order_id, sl_order_id, buy_fill_px, updated_at)
             VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
             ON CONFLICT(symbol, buy_level)
             DO UPDATE SET
@@ -944,6 +1113,7 @@ def db_upsert_lot(
                 sell_order_id=COALESCE(EXCLUDED.sell_order_id, grid_lots.sell_order_id),
                 tp_order_id=COALESCE(EXCLUDED.tp_order_id, grid_lots.tp_order_id),
                 sl_order_id=COALESCE(EXCLUDED.sl_order_id, grid_lots.sl_order_id),
+                buy_fill_px=COALESCE(EXCLUDED.buy_fill_px, grid_lots.buy_fill_px),
                 updated_at=now();
         """,
             (
@@ -956,6 +1126,7 @@ def db_upsert_lot(
                 sell_order_id,
                 tp_order_id,
                 sl_order_id,
+                buy_fill_px,
             ),
         )
 
@@ -1195,6 +1366,69 @@ def reconcile_lots(conn, symbol: str, open_orders):
         # -------------------------
         # SELL open -> filled/canceled/unknown (BRACKET-AWARE: TP vs SL)
         # -------------------------
+
+        # BRACKET RECOVERY: if tp/sl leg IDs were not captured at submit time,
+        # attempt to recover them by scanning recent orders for child legs whose
+        # parent_order_id matches this lot's buy_order_id.
+        if state == 'sell_open' and buy_oid and (not tp_oid) and (not sl_oid):
+            try:
+                parent_id = str(buy_oid)
+                candidates = []
+
+                def _side_val(oobj):
+                    try:
+                        s = getattr(oobj, 'side', None)
+                        return str(getattr(s, 'value', s) or '').lower()
+                    except Exception:
+                        return ''
+
+                for oo in list(open_orders) + list(closed):
+                    try:
+                        if _side_val(oo) != 'sell':
+                            continue
+                        po = str(getattr(oo, 'parent_order_id', '') or '')
+                        if po and po == parent_id:
+                            candidates.append(oo)
+                    except Exception:
+                        continue
+
+                rec_tp, rec_sl = '', ''
+                for oo in candidates:
+                    try:
+                        typ = str(getattr(oo, 'type', '') or '').lower()
+                        oid = str(getattr(oo, 'id', '') or '')
+                        if not oid:
+                            continue
+                        if 'stop' in typ and not rec_sl:
+                            rec_sl = oid
+                        elif typ == 'limit' and not rec_tp:
+                            rec_tp = oid
+                        elif not rec_tp:
+                            rec_tp = oid
+                    except Exception:
+                        continue
+
+                if rec_tp or rec_sl:
+                    db_upsert_lot(
+                        conn,
+                        symbol,
+                        float(lot['buy_level']),
+                        float(lot['sell_level']),
+                        float(lot_qty_float(lot)),
+                        'sell_open',
+                        buy_order_id=str(buy_oid),
+                        sell_order_id=(rec_tp or None),
+                        tp_order_id=(rec_tp or None),
+                        sl_order_id=(rec_sl or None),
+                        buy_fill_px=lot.get('buy_fill_px'),
+                    )
+                    tp_oid = rec_tp or tp_oid
+                    sl_oid = rec_sl or sl_oid
+                    sell_oid = rec_tp or sell_oid
+                    log.info(f"{symbol} bracket recovery: backfilled legs tp={rec_tp or '-'} sl={rec_sl or '-'} for parent={parent_id}")
+            except Exception as e:
+                log.warning(f"{symbol} bracket recovery failed: {e}")
+
         tracked_sell_ids = []
         if tp_oid or sl_oid:
             if tp_oid:
@@ -1250,34 +1484,49 @@ def reconcile_lots(conn, symbol: str, open_orders):
                 filled_px = order_filled_avg_price(o)
                 sell_px = float(filled_px) if filled_px > 0 else float(target_level)
                 pnl = (sell_px - buy_level) * qty
+                # Compute true realized PnL (use stored buy fill avg if available)
+                entry_px = float(lot.get('buy_fill_px') or 0.0)
+                if entry_px <= 0.0:
+                    entry_px = float(buy_level)
 
-                if fill_type == "tp":
+                pnl = (sell_px - entry_px) * qty
+                cost = entry_px * qty
+                pnl_pct = (pnl / cost * 100.0) if cost > 0 else 0.0
+
+                outcome = 'tp' if fill_type == 'tp' else ('sl' if fill_type == 'sl' else 'sell')
+
+                # Exactly-once close record (persistent dedupe)
+                first_close = db_mark_lot_closed_once(
+                    conn,
+                    symbol=symbol,
+                    buy_level=buy_level,
+                    outcome=outcome,
+                    qty=qty,
+                    entry_px=entry_px,
+                    exit_px=sell_px,
+                    pnl_usd=pnl,
+                    pnl_pct=pnl_pct,
+                    close_order_id=str(oid_used or ''),
+                )
+
+                if first_close:
+                    # Update lifetime realized PnL
+                    strategy_add_realized_pnl(conn, pnl)
+
+                    # Lot-level completion (exactly-once)
+                    title = 'TAKE-PROFIT' if outcome == 'tp' else ('STOP-LOSS' if outcome == 'sl' else 'SELL')
                     msg = (
-                        f"🎉 TAKE-PROFIT FILLED | {symbol}\n"
+                        f"LOT CLOSED ({title}) | {symbol}\n"
                         f"Qty: {qty:g}\n"
-                        f"Buy: {buy_level:.2f}\n"
-                        f"Sell (TP): {sell_px:.2f}\n"
-                        f"PnL: ${pnl:,.2f}"
+                        f"Entry: {entry_px:.2f}\n"
+                        f"Exit: {sell_px:.2f}\n"
+                        f"Realized PnL: ${pnl:,.2f} ({pnl_pct:+.2f}%)"
                     )
-                    tg_send(msg)
-                    log.info(msg.replace("\n", " | "))
-                    db_record_tp_win(conn, utc_day(), pnl)
+                    tg_enqueue_event(conn, f"lot_closed:{symbol}:{d2(buy_level):.2f}", 'lot', msg)
 
-                elif fill_type == "sl":
-                    msg = (
-                        f"🚨 STOP-LOSS HIT | {symbol}\n"
-                        f"Qty: {qty:g}\n"
-                        f"Buy: {buy_level:.2f}\n"
-                        f"Exit (SL): {sell_px:.2f}\n"
-                        f"PnL: ${pnl:,.2f}"
-                    )
-                    tg_send(msg)
-                    log.warning(msg.replace("\n", " | "))
-
-                else:
-                    msg = f"ℹ️ SELL FILLED | {symbol}\nQty: {qty:g}\nExit: {sell_px:.2f}\nPnL: ${pnl:,.2f}"
-                    tg_send(msg)
-                    log.info(msg.replace("\n", " | "))
+                    # Daily TP wins counter preserved (existing behavior, now driven by confirmed closure)
+                    if outcome == 'tp':
+                        db_record_tp_win(conn, utc_day(), pnl)
 
                 db_delete_lot(conn, symbol, float(lot["buy_level"]))
 
@@ -1717,6 +1966,7 @@ def run():
         maybe_alert_lot_stuck(conn)
         compute_confidence_score(conn)
         maybe_daily_summary(conn)
+        tg_flush_outbox(conn)
 
         conn.commit()
         return jsonify({"status": "ok", "results": results})
@@ -1807,6 +2057,14 @@ def telegram_webhook():
 
         if not TELEGRAM_CHAT_ID or chat_id != str(TELEGRAM_CHAT_ID):
             return "ok", 200
+
+        if msg.strip().lower() in ("/performance", "/pnl"):
+            conn = pg_conn()
+            try:
+                tg_enqueue_event(conn, f"strategy_perf_manual:{now_utc().isoformat()}", 'strategy', build_strategy_performance_text(conn))
+                tg_flush_outbox(conn)
+            finally:
+                conn.close()
 
         if msg.strip().lower() == "/status":
             lines = [
