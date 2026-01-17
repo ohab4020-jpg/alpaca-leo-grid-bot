@@ -1159,7 +1159,7 @@ def db_upsert_lot(
         cur.execute(
             """
             INSERT INTO grid_lots(symbol, buy_level, sell_level, qty, state, buy_order_id, sell_order_id, tp_order_id, sl_order_id, buy_fill_px, updated_at)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,,%s%s,now())
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
             ON CONFLICT(symbol, buy_level)
             DO UPDATE SET
                 sell_level=EXCLUDED.sell_level,
